@@ -77,6 +77,17 @@
   .msg.me code{background:rgba(255,255,255,.18)}
   .msg a{color:inherit;text-decoration:underline}
 
+  /* pronunciation coach card */
+  .coach{
+    align-self:flex-start;max-width:82%;background:#fff;
+    border:1px solid var(--line);border-left:3px solid var(--accent);
+    border-radius:12px;padding:10px 13px;font-size:13.5px;line-height:1.5;
+  }
+  .coach .top{display:flex;align-items:center;gap:7px;margin-bottom:5px;font-weight:600;color:var(--ink)}
+  .coach .score{margin-left:auto;font-weight:700;font-size:11.5px;padding:2px 9px;border-radius:999px;color:#fff}
+  .coach .heard{color:var(--muted);font-style:italic;margin-bottom:4px}
+  .coach .fb{color:#374151}
+
   /* typing dots */
   .typing{display:inline-flex;gap:4px;align-items:center;padding:14px 16px}
   .typing span{
@@ -163,7 +174,7 @@
 
 <script>
   const AGENT = "https://n8nn.discloud.app/webhook/agente-ingles";
-  const STT   = "https://n8nn.discloud.app/webhook/transcrever";
+  const PRON  = "https://n8nn.discloud.app/webhook/pronuncia";
   const sessionId = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2,8);
 
   const log  = document.getElementById("log");
@@ -171,11 +182,12 @@
   const inp  = document.getElementById("inp");
   const btn  = document.getElementById("b");
   const mic  = document.getElementById("mic");
+  let lastBotText = "";
 
   // ---- minimal & safe markdown (escape first, then bold/italic/code) ----
+  function esc(t){ return (t||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
   function fmt(t){
-    return t
-      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+    return esc(t)
       .replace(/\*\*([^*]+)\*\*/g,"<strong>$1</strong>")
       .replace(/(^|[\s(])\*([^*\n]+)\*/g,"$1<em>$2</em>")
       .replace(/`([^`]+)`/g,"<code>$1</code>");
@@ -186,7 +198,7 @@
     row.className = "row " + (cls === "me" ? "me" : "bot");
     const d = document.createElement("div");
     d.className = "msg " + cls;
-    if(cls === "bot") d.innerHTML = fmt(text); else d.textContent = text;
+    if(cls === "bot"){ d.innerHTML = fmt(text); lastBotText = text; } else d.textContent = text;
     row.appendChild(d); log.appendChild(row);
     log.scrollTop = log.scrollHeight;
     return row;
@@ -200,6 +212,22 @@
     return row;
   }
 
+  // ---- card de avaliação de pronúncia ----
+  function addCoach(d){
+    let score = parseInt(d.score); if(isNaN(score)) score = 0;
+    score = Math.max(0, Math.min(100, score));
+    const color = score>=80 ? "#16a34a" : score>=60 ? "#d97706" : "#dc2626";
+    const heard = (d.heard||"").trim(), target = (d.target||"").trim();
+    const row = document.createElement("div"); row.className = "row";
+    const card = document.createElement("div"); card.className = "coach";
+    let html = '<div class="top">🗣️ Pronúncia <span class="score" style="background:'+color+'">'+score+'/100</span></div>';
+    if(heard && heard.toLowerCase() !== target.toLowerCase())
+      html += '<div class="heard">Ouvi: "'+esc(heard)+'"</div>';
+    if(d.feedback) html += '<div class="fb">'+esc(d.feedback)+'</div>';
+    card.innerHTML = html; row.appendChild(card); log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+  }
+
   add("Hello! 👋 Sou seu professor de inglês baseado no livro *The Way to English — Book 1*. Pode escrever ou falar no microfone. What's your name?", "bot");
 
   // ---- auto-grow textarea ----
@@ -209,13 +237,10 @@
     if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); form.requestSubmit(); }
   });
 
-  // ---- send message ----
-  form.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const text = inp.value.trim(); if(!text) return;
-    add(text, "me");
-    inp.value = ""; autogrow(); btn.disabled = true;
-    const typing = addTyping();
+  // ---- conversa com o professor (texto e voz reutilizam) ----
+  async function sendToTeacher(text, showUser){
+    if(showUser) add(text, "me");
+    btn.disabled = true; const typing = addTyping();
     try{
       const r = await fetch(AGENT, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ message:text, sessionId }) });
       if(!r.ok) throw new Error("HTTP " + r.status);
@@ -223,12 +248,45 @@
       typing.remove(); add(data.response || data.output || "(resposta vazia)", "bot");
     }catch(err){ typing.remove(); add("Não consegui falar com o professor agora. " + err.message, "err"); }
     finally{ btn.disabled = false; inp.focus(); }
+  }
+
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const text = inp.value.trim(); if(!text) return;
+    inp.value = ""; autogrow();
+    sendToTeacher(text, true);
   });
 
-  // ---- microfone -> Whisper ----
-  let rec=null, chunks=[], recording=false;
-  function blobToB64(blob){ return new Promise(res=>{ const fr=new FileReader(); fr.onloadend=()=>res(fr.result.split(",")[1]); fr.readAsDataURL(blob); }); }
+  // ---- áudio: WebM/Opus -> WAV 16k mono (gpt-audio só aceita wav/mp3) ----
+  function ab2b64(buf){
+    let bin = ""; const bytes = new Uint8Array(buf), chunk = 0x8000;
+    for(let i=0;i<bytes.length;i+=chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+chunk));
+    return btoa(bin);
+  }
+  function encodeWav(samples, rate){
+    const buf = new ArrayBuffer(44 + samples.length*2), v = new DataView(buf);
+    const w = (o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i, s.charCodeAt(i)); };
+    w(0,"RIFF"); v.setUint32(4,36+samples.length*2,true); w(8,"WAVE");
+    w(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+    v.setUint32(24,rate,true); v.setUint32(28,rate*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+    w(36,"data"); v.setUint32(40,samples.length*2,true);
+    let o=44; for(let i=0;i<samples.length;i++){ let s=Math.max(-1,Math.min(1,samples[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true); o+=2; }
+    return buf;
+  }
+  async function blobToWavB64(blob){
+    const arr = await blob.arrayBuffer();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = new AC();
+    const decoded = await ac.decodeAudioData(arr); ac.close();
+    const rate = 16000, len = Math.max(1, Math.ceil(decoded.duration*rate));
+    const off = new OfflineAudioContext(1, len, rate);
+    const src = off.createBufferSource(); src.buffer = decoded; src.connect(off.destination); src.start();
+    const rendered = await off.startRendering();
+    return ab2b64(encodeWav(rendered.getChannelData(0), rate));
+  }
 
+  // ---- microfone -> avaliação de pronúncia + conversa ----
+  let rec=null, chunks=[], recording=false;
   mic.addEventListener("click", async () => {
     if(!recording){
       try{
@@ -240,14 +298,17 @@
           const blob = new Blob(chunks, {type:"audio/webm"});
           mic.disabled = true; const typing = addTyping();
           try{
-            const b64 = await blobToB64(blob);
-            const r = await fetch(STT, { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ audioBase64:b64, mimeType:"audio/webm" }) });
+            const b64 = await blobToWavB64(blob);
+            const r = await fetch(PRON, { method:"POST", headers:{"Content-Type":"application/json"},
+              body: JSON.stringify({ audioBase64:b64, format:"wav", sessionId, context:lastBotText }) });
             if(!r.ok) throw new Error("HTTP " + r.status);
-            const data = await r.json(); typing.remove();
-            const t = (data.text||"").trim();
-            if(t){ inp.value = t; autogrow(); form.requestSubmit(); }
-            else { add("Não entendi o áudio, pode repetir?", "err"); }
-          }catch(err){ typing.remove(); add("Erro na transcrição: " + err.message, "err"); }
+            const d = await r.json(); typing.remove();
+            const said = (d.target || d.heard || "").trim();
+            if(!said){ add("Não entendi o áudio, pode repetir?", "err"); return; }
+            add(said, "me");          // bolha do aluno (frase pretendida)
+            addCoach(d);              // card com nota + correção da pronúncia
+            await sendToTeacher(said, false); // continua a aula
+          }catch(err){ typing.remove(); add("Erro ao avaliar o áudio: " + err.message, "err"); }
           finally{ mic.disabled = false; }
         };
         rec.start(); recording = true; mic.classList.add("rec"); mic.title = "Parar";
