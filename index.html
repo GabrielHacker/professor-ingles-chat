@@ -370,15 +370,20 @@
     return said;
   }
 
-  async function sendToTeacher(text, showUser){
+  async function sendToTeacher(text, showUser, speakPrefix){
     if(showUser) add(text, "me");
     btn.disabled = true; const typing = addTyping();
     try{
       const reply = await askTeacher(text);
       typing.remove(); add(reply, "bot");
-      if(speakerOn) speak(reply);
+      if(speakerOn) speak((speakPrefix || "") + reply);
     }catch(err){ typing.remove(); add("Não consegui falar com o professor agora. " + err.message, "err"); }
     finally{ btn.disabled = false; inp.focus(); }
+  }
+
+  // prefixo de correção de pronúncia para ser FALADO (determinístico)
+  function fixSpoken(pr){
+    return (pr && pr.feedback && (pr.score == null || pr.score < 85)) ? (pr.feedback + " ... ") : "";
   }
 
   // ---- toggle da voz ----
@@ -486,7 +491,7 @@
         const said = (d.target || d.heard || "").trim();
         if(!said){ add("Não entendi o áudio, pode repetir?", "err"); return; }
         add(said, "me"); addCoach(d);
-        await sendToTeacher(buildMsg(said, d), false);
+        await sendToTeacher(said, false, fixSpoken(d));
       }catch(err){ typing.remove(); add("Erro ao avaliar o áudio: " + err.message, "err"); }
       finally{ mic.disabled = false; }
     }
@@ -554,10 +559,10 @@
         const said = (pr.target || pr.heard || "").trim();
         if(!said){ continue; }
         add(said, "me"); addCoach(pr);
-        const reply = await askTeacher(buildMsg(said, pr));
+        const reply = await askTeacher(said);
         if(!inCall) break;
         add(reply, "bot");
-        setOrb("speaking", "Falando…"); await speak(reply);
+        setOrb("speaking", "Falando…"); await speak(fixSpoken(pr) + reply);
       }catch(err){ setOrb("", "Ops… tente de novo"); await wait(900); }
     }
   }
