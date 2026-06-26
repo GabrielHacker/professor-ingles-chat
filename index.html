@@ -46,9 +46,9 @@
     background:linear-gradient(145deg,#0f766e,#14a08a);
     box-shadow:0 4px 12px rgba(15,118,110,.28);
   }
-  .head-txt{min-width:0;flex:1}
-  .head-txt h1{font-size:15.5px;font-weight:650;letter-spacing:-.01em;line-height:1.2}
-  .head-txt p{font-size:12.5px;color:var(--muted);margin-top:2px;display:flex;align-items:center;gap:6px}
+  .head-txt{min-width:0;flex:1;overflow:hidden}
+  .head-txt h1{font-size:15.5px;font-weight:650;letter-spacing:-.01em;line-height:1.2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .head-txt p{font-size:12.5px;color:var(--muted);margin-top:2px;display:flex;align-items:center;gap:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .dot{width:7px;height:7px;border-radius:50%;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18)}
 
   /* ---------- Log ---------- */
@@ -380,11 +380,34 @@
     sendToTeacher(text, true);
   });
 
-  // ---- áudio: WebM/Opus -> WAV 16k mono (gpt-audio só aceita wav/mp3) ----
+  // ---- captura PCM cru -> WAV 16k mono (robusto, sem MediaRecorder/decodeAudioData) ----
+  let _ac = null;
+  function getAC(){
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!_ac) _ac = new AC();
+    if(_ac.state === "suspended"){ _ac.resume(); }
+    return _ac;
+  }
   function ab2b64(buf){
     let bin = ""; const bytes = new Uint8Array(buf), chunk = 0x8000;
     for(let i=0;i<bytes.length;i+=chunk) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+chunk));
     return btoa(bin);
+  }
+  function mergeBuffers(chunks){
+    let len = 0; for(const c of chunks) len += c.length;
+    const out = new Float32Array(len); let o = 0;
+    for(const c of chunks){ out.set(c, o); o += c.length; }
+    return out;
+  }
+  function downsample(buf, inRate, outRate){
+    if(outRate >= inRate) return buf;
+    const ratio = inRate / outRate, newLen = Math.round(buf.length / ratio);
+    const out = new Float32Array(newLen);
+    for(let i=0;i<newLen;i++){
+      const idx = i*ratio, i0 = Math.floor(idx), i1 = Math.min(i0+1, buf.length-1), f = idx-i0;
+      out[i] = buf[i0]*(1-f) + buf[i1]*f;
+    }
+    return out;
   }
   function encodeWav(samples, rate){
     const buf = new ArrayBuffer(44 + samples.length*2), v = new DataView(buf);
@@ -396,48 +419,57 @@
     let o=44; for(let i=0;i<samples.length;i++){ let s=Math.max(-1,Math.min(1,samples[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true); o+=2; }
     return buf;
   }
-  async function blobToWavB64(blob){
-    const arr = await blob.arrayBuffer();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const ac = new AC();
-    const decoded = await ac.decodeAudioData(arr); ac.close();
-    const rate = 16000, len = Math.max(1, Math.ceil(decoded.duration*rate));
-    const off = new OfflineAudioContext(1, len, rate);
-    const src = off.createBufferSource(); src.buffer = decoded; src.connect(off.destination); src.start();
-    const rendered = await off.startRendering();
-    return ab2b64(encodeWav(rendered.getChannelData(0), rate));
+  function samplesToWavB64(samples, rate){
+    return ab2b64(encodeWav(downsample(samples, rate, 16000), 16000));
+  }
+  function createPcmRecorder(stream){
+    const ac = getAC();
+    const src = ac.createMediaStreamSource(stream);
+    const proc = ac.createScriptProcessor(4096, 1, 1);
+    const sink = ac.createGain(); sink.gain.value = 0;   // sem feedback no alto-falante
+    const chunks = []; const rec = { rms:0, sampleRate:ac.sampleRate, _stopped:false };
+    proc.onaudioprocess = (e)=>{
+      if(rec._stopped) return;
+      const ch = e.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(ch));
+      let s = 0; for(let i=0;i<ch.length;i++) s += ch[i]*ch[i];
+      rec.rms = Math.sqrt(s/ch.length);
+    };
+    src.connect(proc); proc.connect(sink); sink.connect(ac.destination);
+    rec.stop = ()=>{ rec._stopped = true; try{ src.disconnect(); proc.disconnect(); sink.disconnect(); }catch(e){} return { samples:mergeBuffers(chunks), sampleRate:ac.sampleRate }; };
+    return rec;
+  }
+  async function avaliarPronuncia(samples, rate){
+    const b64 = samplesToWavB64(samples, rate);
+    const r = await fetch(PRON, { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ audioBase64:b64, format:"wav", sessionId, context:lastBotText }) });
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
   }
 
-  // ---- microfone -> avaliação de pronúncia + conversa ----
-  let rec=null, chunks=[], recording=false;
+  // ---- microfone (chat) -> avaliação de pronúncia + conversa ----
+  let pcmRec=null, recStream=null, recording=false;
   mic.addEventListener("click", async () => {
     if(!recording){
       try{
-        const stream = await navigator.mediaDevices.getUserMedia({audio:true});
-        rec = new MediaRecorder(stream); chunks=[];
-        rec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
-        rec.onstop = async () => {
-          stream.getTracks().forEach(t=>t.stop());
-          const blob = new Blob(chunks, {type:"audio/webm"});
-          mic.disabled = true; const typing = addTyping();
-          try{
-            const b64 = await blobToWavB64(blob);
-            const r = await fetch(PRON, { method:"POST", headers:{"Content-Type":"application/json"},
-              body: JSON.stringify({ audioBase64:b64, format:"wav", sessionId, context:lastBotText }) });
-            if(!r.ok) throw new Error("HTTP " + r.status);
-            const d = await r.json(); typing.remove();
-            const said = (d.target || d.heard || "").trim();
-            if(!said){ add("Não entendi o áudio, pode repetir?", "err"); return; }
-            add(said, "me");          // bolha do aluno (frase pretendida)
-            addCoach(d);              // card com nota + correção da pronúncia
-            await sendToTeacher(said, false); // continua a aula
-          }catch(err){ typing.remove(); add("Erro ao avaliar o áudio: " + err.message, "err"); }
-          finally{ mic.disabled = false; }
-        };
-        rec.start(); recording = true; mic.classList.add("rec"); mic.title = "Parar";
+        recStream = await navigator.mediaDevices.getUserMedia({audio:true});
+        pcmRec = createPcmRecorder(recStream);
+        recording = true; mic.classList.add("rec"); mic.title = "Parar";
       }catch(err){ add("Sem acesso ao microfone: " + err.message, "err"); }
     } else {
-      rec.stop(); recording = false; mic.classList.remove("rec"); mic.title = "Falar";
+      recording = false; mic.classList.remove("rec"); mic.title = "Falar";
+      const cap = pcmRec.stop();
+      if(recStream){ recStream.getTracks().forEach(t=>t.stop()); recStream = null; }
+      mic.disabled = true; const typing = addTyping();
+      try{
+        if(cap.samples.length < cap.sampleRate*0.3){ typing.remove(); add("Áudio muito curto — segure o microfone e fale um pouco mais.", "err"); return; }
+        const d = await avaliarPronuncia(cap.samples, cap.sampleRate); typing.remove();
+        const said = (d.target || d.heard || "").trim();
+        if(!said){ add("Não entendi o áudio, pode repetir?", "err"); return; }
+        add(said, "me"); addCoach(d);
+        await sendToTeacher(said, false);
+      }catch(err){ typing.remove(); add("Erro ao avaliar o áudio: " + err.message, "err"); }
+      finally{ mic.disabled = false; }
     }
   });
 
@@ -492,13 +524,12 @@
     while(inCall){
       if(micMuted){ await wait(300); continue; }
       setOrb("listening", "Pode falar…");
-      const blob = await recordUntilSilence(callStream);
+      const cap = await recordUntilSilence(callStream);
       if(!inCall) break;
-      if(!blob){ continue; }                 // silêncio: escuta de novo
+      if(!cap){ continue; }                  // silêncio: escuta de novo
       setOrb("thinking", "Entendendo…");
       try{
-        const wav = await blobToWavB64(blob);
-        const pr  = await fetchJson(PRON, { audioBase64:wav, format:"wav", sessionId, context:lastBotText });
+        const pr = await avaliarPronuncia(cap.samples, cap.sampleRate);
         const said = (pr.target || pr.heard || "").trim();
         if(!said){ continue; }
         add(said, "me"); addCoach(pr);
@@ -510,31 +541,21 @@
     }
   }
 
-  // grava até detectar ~1.1s de silêncio (VAD simples por RMS)
+  // grava até detectar ~1s de silêncio (VAD simples por RMS no PCM)
   function recordUntilSilence(stream){
     return new Promise(resolve => {
       let done = false, started = false;
-      const finish = (blob)=>{ if(done) return; done = true; try{ ac.close(); }catch(e){} abortRec = null; resolve(blob); };
-      const rc = new MediaRecorder(stream); const chunks = [];
-      rc.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
-      rc.onstop = () => finish((started && chunks.length) ? new Blob(chunks, {type:"audio/webm"}) : null);
-      const AC = window.AudioContext || window.webkitAudioContext;
-      const ac = new AC(); const src = ac.createMediaStreamSource(stream);
-      const an = ac.createAnalyser(); an.fftSize = 512; src.connect(an);
-      const data = new Uint8Array(an.fftSize);
+      const rec = createPcmRecorder(stream);
       let silence = 0, t0 = performance.now();
-      abortRec = () => { try{ rc.stop(); }catch(e){} };
-      rc.start();
+      const finish = (val)=>{ if(done) return; done = true; abortRec = null; resolve(val); };
+      abortRec = () => { rec.stop(); finish(null); };
       const tick = () => {
         if(done) return;
-        if(!inCall || micMuted){ try{ rc.stop(); }catch(e){} return; }
-        an.getByteTimeDomainData(data);
-        let sum = 0; for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
-        const rms = Math.sqrt(sum/data.length), now = performance.now();
-        if(rms > 0.045){ started = true; silence = now; }
-        if(started && now - silence > 1100){ try{ rc.stop(); }catch(e){} return; }  // fim da fala
-        if(now - t0 > 15000){ try{ rc.stop(); }catch(e){} return; }                 // máx 15s
-        if(!started && now - t0 > 8000){ try{ rc.stop(); }catch(e){} return; }       // ninguém falou
+        if(!inCall || micMuted){ rec.stop(); finish(null); return; }
+        const rms = rec.rms, now = performance.now();
+        if(rms > 0.02){ started = true; silence = now; }
+        const stop = (started && now - silence > 1000) || (now - t0 > 15000) || (!started && now - t0 > 8000);
+        if(stop){ const cap = rec.stop(); finish((started && cap.samples.length) ? cap : null); return; }
         requestAnimationFrame(tick);
       };
       requestAnimationFrame(tick);
