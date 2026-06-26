@@ -111,7 +111,7 @@
   @keyframes fade{from{opacity:0}to{opacity:1}}
   .call .who{font-size:19px;font-weight:650;letter-spacing:-.01em}
   .orb{
-    width:150px;height:150px;border-radius:50%;
+    width:150px;height:150px;border-radius:50%;cursor:pointer;
     background:radial-gradient(circle at 35% 30%,#eafff8,#bfeee3 45%,#6fccbb 100%);
     box-shadow:0 0 0 0 rgba(255,255,255,.45);position:relative;
     transition:transform .2s;
@@ -265,6 +265,8 @@
   const AGENT = "https://n8nn.discloud.app/webhook/agente-ingles";
   const PRON  = "https://n8nn.discloud.app/webhook/pronuncia";
   const FALAR = "https://n8nn.discloud.app/webhook/falar";
+  const CONV  = "https://n8nn.discloud.app/webhook/conversa";
+  let callHistory = [];
   const sessionId = "web-" + Date.now() + "-" + Math.random().toString(36).slice(2,8);
 
   const log  = document.getElementById("log");
@@ -311,6 +313,7 @@
 
   // ---- card de avaliação de pronúncia ----
   function addCoach(d){
+    if(!d || !d.feedback || d.lang === "pt") return;   // português: não mostra card de pronúncia
     let score = parseInt(d.score); if(isNaN(score)) score = 0;
     score = Math.max(0, Math.min(100, score));
     const color = score>=80 ? "#16a34a" : score>=60 ? "#d97706" : "#dc2626";
@@ -334,7 +337,8 @@
     if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); form.requestSubmit(); }
   });
 
-  // ---- texto -> voz (ElevenLabs via n8n) — nunca trava ----
+  // ---- texto -> voz (ElevenLabs via n8n) — nunca trava, interrompível ----
+  let _speakFin = null;
   async function speak(text){
     if(!text) return;
     try{
@@ -344,13 +348,15 @@
       if(audioEl.src) URL.revokeObjectURL(audioEl.src);
       audioEl.src = URL.createObjectURL(blob);
       await new Promise(res => {
-        let done = false; const fin = ()=>{ if(done) return; done = true; res(); };
+        let done = false; const fin = ()=>{ if(done) return; done = true; _speakFin = null; res(); };
+        _speakFin = fin;               // permite interromper
         audioEl.onended = fin; audioEl.onerror = fin;
         audioEl.play().catch(fin);     // se o play falhar/for bloqueado, resolve
         setTimeout(fin, 30000);        // trava de segurança
       });
     }catch(e){ /* sem voz não quebra a conversa */ }
   }
+  function stopSpeaking(){ try{ audioEl.pause(); }catch(e){} if(_speakFin) _speakFin(); }
 
   // ---- conversa com o professor; retorna o texto da resposta ----
   async function askTeacher(text){
@@ -488,7 +494,7 @@
   mic.addEventListener("click", async () => {
     if(!recording){
       try{
-        recStream = await navigator.mediaDevices.getUserMedia({audio:true});
+        recStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
         pcmRec = createPcmRecorder(recStream);
         recording = true; mic.classList.add("rec"); mic.title = "Parar";
       }catch(err){ add("Sem acesso ao microfone: " + err.message, "err"); }
@@ -526,6 +532,32 @@
   }
   function setOrb(state, text){ orb.className = "orb " + (state||""); if(text != null) callStatus.textContent = text; }
 
+  // monitora o microfone DURANTE a fala; se o aluno começar a falar, interrompe (barge-in)
+  function monitorBargeIn(stream, onDetect){
+    let stopped = false; const ac = getAC();
+    const src = ac.createMediaStreamSource(stream);
+    const an = ac.createAnalyser(); an.fftSize = 512; src.connect(an);
+    const data = new Uint8Array(an.fftSize);
+    const armAt = performance.now() + 600;   // só arma após 600ms (evita auto-disparo no início)
+    let loud = 0;
+    const tick = ()=>{
+      if(stopped) return;
+      an.getByteTimeDomainData(data);
+      let sum = 0; for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum += v*v; }
+      const rms = Math.sqrt(sum/data.length);
+      if(performance.now() > armAt){
+        if(rms > 0.08){ loud++; if(loud > 6){ stopped = true; try{src.disconnect();an.disconnect();}catch(e){} onDetect(); return; } }
+        else loud = Math.max(0, loud-1);
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return ()=>{ stopped = true; try{ src.disconnect(); an.disconnect(); }catch(e){} };
+  }
+
+  // tocar na esfera interrompe a fala
+  orb.addEventListener("click", ()=>{ if(inCall) stopSpeaking(); });
+
   callBtn.addEventListener("click", startCall);
   endBtn.addEventListener("click", endCall);
   muteBtn.addEventListener("click", ()=>{
@@ -540,13 +572,17 @@
     setOrb("thinking", "Conectando…");
     // desbloqueia o áudio dentro do gesto do clique (iOS) — SEM await pra não travar
     try{ audioEl.muted = true; audioEl.play().catch(()=>{}); }catch(e){}
-    try{ callStream = await navigator.mediaDevices.getUserMedia({audio:true}); }
+    try{ callStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}}); }
     catch(err){ setOrb("", "Sem acesso ao microfone"); add("Sem acesso ao microfone: " + err.message, "err"); await wait(1300); endCall(); return; }
     try{ audioEl.muted = false; }catch(e){}
     inCall = true; micMuted = false; muteBtn.classList.remove("muted");
+    callHistory = [];
     const hi = "Hi! I'm your English teacher. Vamos conversar. What's your name?";
     add(hi, "bot");
-    setOrb("speaking", "Falando…"); await speak(hi);
+    callHistory.push({ role:"assistant", content:hi });
+    setOrb("speaking", "Falando… (fale ou toque para interromper)");
+    const stopMon = monitorBargeIn(callStream, stopSpeaking);
+    await speak(hi); stopMon();
     callLoop();
   }
 
@@ -567,14 +603,20 @@
       if(!cap){ continue; }                  // silêncio: escuta de novo
       setOrb("thinking", "Entendendo…");
       try{
-        const pr = await avaliarPronuncia(cap.samples, cap.sampleRate);
-        const said = (pr.target || pr.heard || "").trim();
-        if(!said){ continue; }
-        add(said, "me"); addCoach(pr);
-        const reply = await askTeacher(said);
+        const b64 = await samplesToWavB64(cap.samples, cap.sampleRate);
+        const d = await fetchJson(CONV, { audioBase64:b64, format:"wav", history:callHistory });  // 1 chamada: ouve + corrige + responde
+        const heard = (d.heard || "").trim(), reply = (d.reply || "").trim();
+        if(!heard && !reply){ continue; }
+        if(heard) add(heard, "me");
+        if(reply) add(reply, "bot");
+        callHistory.push({ role:"user", content:heard }, { role:"assistant", content:reply });
+        if(callHistory.length > 16) callHistory = callHistory.slice(-16);
         if(!inCall) break;
-        add(reply, "bot");
-        setOrb("speaking", "Falando…"); await speak(fixSpoken(pr) + reply);
+        if(!reply){ continue; }
+        setOrb("speaking", "Falando… (fale ou toque para interromper)");
+        const stopMon = monitorBargeIn(callStream, stopSpeaking);
+        await speak(reply);
+        stopMon();
       }catch(err){ setOrb("", "Ops… tente de novo"); await wait(900); }
     }
   }
