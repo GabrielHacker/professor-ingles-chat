@@ -334,7 +334,7 @@
     if(e.key === "Enter" && !e.shiftKey){ e.preventDefault(); form.requestSubmit(); }
   });
 
-  // ---- texto -> voz (ElevenLabs via n8n) ----
+  // ---- texto -> voz (ElevenLabs via n8n) — nunca trava ----
   async function speak(text){
     if(!text) return;
     try{
@@ -343,8 +343,12 @@
       const blob = await r.blob();
       if(audioEl.src) URL.revokeObjectURL(audioEl.src);
       audioEl.src = URL.createObjectURL(blob);
-      await audioEl.play();
-      await new Promise(res => { audioEl.onended = res; audioEl.onerror = res; });
+      await new Promise(res => {
+        let done = false; const fin = ()=>{ if(done) return; done = true; res(); };
+        audioEl.onended = fin; audioEl.onerror = fin;
+        audioEl.play().catch(fin);     // se o play falhar/for bloqueado, resolve
+        setTimeout(fin, 30000);        // trava de segurança
+      });
     }catch(e){ /* sem voz não quebra a conversa */ }
   }
 
@@ -354,6 +358,16 @@
     if(!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
     return data.response || data.output || "(resposta vazia)";
+  }
+
+  // ---- monta a mensagem pro professor incluindo a avaliação de pronúncia ----
+  function buildMsg(said, pr){
+    if(pr && pr.feedback && (pr.score == null || pr.score < 90)){
+      return said + "\n\n[Nota do sistema — avaliação de pronúncia do áudio do aluno: ouvi \"" + (pr.heard || said) +
+        "\", nota " + (pr.score != null ? pr.score : "?") + "/100. " + pr.feedback +
+        " Corrija a pronúncia do aluno com gentileza, em português, dizendo a forma correta, e depois continue a aula.]";
+    }
+    return said;
   }
 
   async function sendToTeacher(text, showUser){
@@ -472,7 +486,7 @@
         const said = (d.target || d.heard || "").trim();
         if(!said){ add("Não entendi o áudio, pode repetir?", "err"); return; }
         add(said, "me"); addCoach(d);
-        await sendToTeacher(said, false);
+        await sendToTeacher(buildMsg(said, d), false);
       }catch(err){ typing.remove(); add("Erro ao avaliar o áudio: " + err.message, "err"); }
       finally{ mic.disabled = false; }
     }
@@ -505,13 +519,15 @@
 
   async function startCall(){
     if(inCall) return;
-    try{ callStream = await navigator.mediaDevices.getUserMedia({audio:true}); }
-    catch(err){ add("Sem acesso ao microfone: " + err.message, "err"); return; }
-    inCall = true; micMuted = false; muteBtn.classList.remove("muted");
     callEl.classList.add("show");
-    // desbloqueia o áudio dentro do gesto do clique (iOS)
-    try{ audioEl.muted = true; await audioEl.play().catch(()=>{}); audioEl.pause(); audioEl.muted = false; }catch(e){}
-    const hi = "Hello! Vamos conversar em inglês. What's your name?";
+    setOrb("thinking", "Conectando…");
+    // desbloqueia o áudio dentro do gesto do clique (iOS) — SEM await pra não travar
+    try{ audioEl.muted = true; audioEl.play().catch(()=>{}); }catch(e){}
+    try{ callStream = await navigator.mediaDevices.getUserMedia({audio:true}); }
+    catch(err){ setOrb("", "Sem acesso ao microfone"); add("Sem acesso ao microfone: " + err.message, "err"); await wait(1300); endCall(); return; }
+    try{ audioEl.muted = false; }catch(e){}
+    inCall = true; micMuted = false; muteBtn.classList.remove("muted");
+    const hi = "Hi! I'm your English teacher. Vamos conversar. What's your name?";
     add(hi, "bot");
     setOrb("speaking", "Falando…"); await speak(hi);
     callLoop();
@@ -538,7 +554,7 @@
         const said = (pr.target || pr.heard || "").trim();
         if(!said){ continue; }
         add(said, "me"); addCoach(pr);
-        const reply = await askTeacher(said);
+        const reply = await askTeacher(buildMsg(said, pr));
         if(!inCall) break;
         add(reply, "bot");
         setOrb("speaking", "Falando…"); await speak(reply);
