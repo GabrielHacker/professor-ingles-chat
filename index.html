@@ -443,8 +443,20 @@
     let o=44; for(let i=0;i<samples.length;i++){ let s=Math.max(-1,Math.min(1,samples[i])); v.setInt16(o, s<0?s*0x8000:s*0x7FFF, true); o+=2; }
     return buf;
   }
-  function samplesToWavB64(samples, rate){
-    return ab2b64(encodeWav(downsample(samples, rate, 16000), 16000));
+  // reamostra pra 16k com FILTRO correto (OfflineAudioContext) — sem aliasing/distorção
+  async function samplesToWavB64(samples, rate){
+    let out = samples, outRate = rate;
+    if(rate > 16000 && typeof OfflineAudioContext !== "undefined"){
+      try{
+        const off = new OfflineAudioContext(1, Math.max(1, Math.round(samples.length * 16000 / rate)), 16000);
+        const b = off.createBuffer(1, samples.length, rate);
+        b.getChannelData(0).set(samples);
+        const s = off.createBufferSource(); s.buffer = b; s.connect(off.destination); s.start();
+        const rendered = await off.startRendering();
+        out = rendered.getChannelData(0); outRate = 16000;
+      }catch(e){ out = samples; outRate = rate; }
+    }
+    return ab2b64(encodeWav(out, outRate));
   }
   function createPcmRecorder(stream){
     const ac = getAC();
@@ -464,9 +476,9 @@
     return rec;
   }
   async function avaliarPronuncia(samples, rate){
-    const b64 = samplesToWavB64(samples, rate);
+    const b64 = await samplesToWavB64(samples, rate);
     const r = await fetch(PRON, { method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({ audioBase64:b64, format:"wav", sessionId, context:lastBotText }) });
+      body: JSON.stringify({ audioBase64:b64, format:"wav", sessionId }) });
     if(!r.ok) throw new Error("HTTP " + r.status);
     return r.json();
   }
