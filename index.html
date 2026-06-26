@@ -381,9 +381,9 @@
     finally{ btn.disabled = false; inp.focus(); }
   }
 
-  // prefixo de correção de pronúncia para ser FALADO (determinístico)
+  // prefixo de pronúncia para ser SEMPRE falado (corrige se errou, elogia se acertou)
   function fixSpoken(pr){
-    return (pr && pr.feedback && (pr.score == null || pr.score < 85)) ? (pr.feedback + " ... ") : "";
+    return (pr && pr.feedback) ? (pr.feedback + " ... ") : "";
   }
 
   // ---- toggle da voz ----
